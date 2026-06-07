@@ -1,0 +1,4 @@
+telethon
+TgCrypto~=1.2.5
+py-tgcalls~=2.2.11
+aiohttp
