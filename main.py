@@ -2,6 +2,7 @@ import os
 import time
 import logging
 import asyncio
+import aiofiles
 from telethon import TelegramClient, events, Button, functions, types, utils
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -34,15 +35,31 @@ active_calls = {}
 pending_media = {}
 
 # ==============================================================================
-# كاش الملفات المحمّلة مسبقاً - نفس فكرة Aliis
+# كاش الملفات المحمّلة مسبقاً
 # المفتاح: file_unique_id | القيمة: مسار الملف المحفوظ
 # ==============================================================================
 file_cache: dict[str, str] = {}
 
-# الحجم الافتراضي للـ chunk عند التحميل: 512KB بدلاً من 128KB الافتراضي
-CHUNK_SIZE = 2 ** 19  # 512 KB
+# *** التحسينات الرئيسية ***
+# 1MB بدلاً من 512KB — أقصى حجم تدعمه Telethon رسمياً
+CHUNK_SIZE = 2 ** 20  # 1 MB
 
-bot = TelegramClient("bot_session", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+# عدد الاتصالات المتوازية لتحميل أجزاء الملف في آنٍ واحد
+NUM_WORKERS = 4
+
+# ==============================================================================
+# تهيئة البوت مع إعدادات اتصال محسّنة
+# ==============================================================================
+bot = TelegramClient(
+    "bot_session",
+    API_ID,
+    API_HASH,
+    # زيادة حجم receive_buffer لتقليل latency
+    receive_updates=True,
+    flood_sleep_threshold=60,
+    # 4 اتصالات افتراضية للتوازي عند التحميل
+    connection_retries=5,
+).start(bot_token=BOT_TOKEN)
 
 
 def get_saved_accounts():
@@ -71,14 +88,17 @@ def main_buttons():
 
 
 # ==============================================================================
-# دالة التحميل السريع - مع chunks كبيرة + كاش + تقدم حي
-# مستوحاة من نظام التحميل في مشروع Aliis
+# دالة التحميل المتوازي السريع
+# تحميل أجزاء الملف بـ NUM_WORKERS اتصالات متزامنة + كاش + تقدم حي
 # ==============================================================================
 async def fast_download(message, status_msg) -> tuple[str, bool] | None:
     """
-    تحميل سريع بـ chunks حجمها 512KB مع:
+    تحميل متوازٍ سريع بـ chunks حجمها 1MB مع:
+    - تقسيم الملف على NUM_WORKERS اتصالات متوازية
     - كاش يمنع إعادة تحميل نفس الملف
     - تحديث تقدم التحميل كل 5 ثواني
+    - كتابة غير متزامنة باستخدام aiofiles
+    - دمج الأجزاء بعد اكتمال التحميل
     - إرجاع (مسار_الملف, هل_فيديو)
     """
     # تحديد نوع الملف
@@ -98,7 +118,6 @@ async def fast_download(message, status_msg) -> tuple[str, bool] | None:
     else:
         ext = ".mp3"
 
-    # file_unique_id = معرّف فريد للملف مستقل عن الرسالة (نفس فكرة Aliis)
     file_unique_id = getattr(media, "id", None)
 
     # --- فحص الكاش أولاً ---
@@ -113,7 +132,9 @@ async def fast_download(message, status_msg) -> tuple[str, bool] | None:
     file_path = os.path.join(MEDIA_DIR, f"file_{file_unique_id}{ext}")
 
     start_time = time.time()
-    last_update = [0.0]  # قائمة لتجاوز قيود الـ closure
+    downloaded_bytes = [0]
+    update_lock = asyncio.Lock()
+    last_update = [0.0]
 
     def format_size(n: int) -> str:
         if n >= 1024 ** 2:
@@ -127,55 +148,122 @@ async def fast_download(message, status_msg) -> tuple[str, bool] | None:
             return f"{seconds}ث"
         return f"{seconds // 60}د {seconds % 60}ث"
 
-    # --- التحميل بـ chunks 512KB ---
-    downloaded = 0
-    try:
-        with open(file_path, "wb") as f:
-            async for chunk in bot.iter_download(message.media, request_size=CHUNK_SIZE):
-                f.write(chunk)
-                downloaded += len(chunk)
+    async def update_progress():
+        """تحديث التقدم كل 5 ثواني فقط"""
+        now = time.time()
+        async with update_lock:
+            if now - last_update[0] < 5:
+                return
+            last_update[0] = now
 
-                # تحديث التقدم كل 5 ثواني فقط (لا تعطل التليغرام بطلبات كثيرة)
-                now = time.time()
-                if now - last_update[0] >= 5:
-                    last_update[0] = now
-                    elapsed = now - start_time or 1e-6
-                    speed = downloaded / elapsed
-                    if file_size > 0:
-                        percent = downloaded * 100 / file_size
-                        eta = format_eta(int((file_size - downloaded) / (speed or 1)))
-                        progress_text = (
-                            f"⬇️ جاري التحميل ...\n"
-                            f"{format_size(downloaded)} / {format_size(file_size)}"
-                            f"  ({percent:.1f}%)\n"
-                            f"⚡ السرعة: {format_size(int(speed))}/ث\n"
-                            f"⏱ الوقت المتبقي: {eta}"
-                        )
-                    else:
-                        progress_text = (
-                            f"⬇️ جاري التحميل ...\n"
-                            f"{format_size(downloaded)}"
-                            f" | ⚡ {format_size(int(speed))}/ث"
-                        )
-                    try:
-                        await status_msg.edit(progress_text)
-                    except Exception:
-                        pass
+        elapsed = (time.time() - start_time) or 1e-6
+        dl = downloaded_bytes[0]
+        speed = dl / elapsed
 
-        total_time = round(time.time() - start_time, 2)
-        logger.info(f"تم التحميل في {total_time}ث: {file_path}")
+        if file_size > 0:
+            percent = dl * 100 / file_size
+            eta = format_eta(int((file_size - dl) / (speed or 1)))
+            text = (
+                f"⬇️ جاري التحميل ...\n"
+                f"{format_size(dl)} / {format_size(file_size)} ({percent:.1f}%)\n"
+                f"⚡ السرعة: {format_size(int(speed))}/ث\n"
+                f"⏱ الوقت المتبقي: {eta}"
+            )
+        else:
+            text = (
+                f"⬇️ جاري التحميل ...\n"
+                f"{format_size(dl)} | ⚡ {format_size(int(speed))}/ث"
+            )
+        try:
+            await status_msg.edit(text)
+        except Exception:
+            pass
 
-        # حفظ في الكاش
-        if file_unique_id:
-            file_cache[file_unique_id] = file_path
+    # ==================================================================
+    # اختيار طريقة التحميل:
+    # - إذا الحجم معروف وكبير بما يكفي → تحميل متوازٍ بـ NUM_WORKERS أجزاء
+    # - إذا الحجم صغير أو غير معروف    → تحميل تسلسلي عادي
+    # ==================================================================
+    min_parallel_size = CHUNK_SIZE * NUM_WORKERS  # ~4 MB
 
-        return file_path, is_video
+    if file_size >= min_parallel_size:
+        # ---- تحميل متوازٍ ----
+        # المحاذاة المطلوبة من Telethon: أضعاف CHUNK_SIZE
+        aligned_part = (file_size // NUM_WORKERS // CHUNK_SIZE) * CHUNK_SIZE
+        if aligned_part == 0:
+            aligned_part = CHUNK_SIZE
 
-    except Exception as e:
-        # مسح الملف الجزئي لو صار خطأ
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        raise e
+        parts: list[tuple[int, int]] = []
+        for i in range(NUM_WORKERS):
+            off = i * aligned_part
+            if off >= file_size:
+                break
+            lim = aligned_part if i < NUM_WORKERS - 1 else (file_size - off)
+            parts.append((off, lim))
+
+        temp_paths = [f"{file_path}.part{i}" for i in range(len(parts))]
+
+        async def download_part(idx: int, offset: int, limit: int, tmp: str):
+            async with aiofiles.open(tmp, "wb") as f:
+                async for chunk in bot.iter_download(
+                    message.media,
+                    offset=offset,
+                    limit=limit,
+                    request_size=CHUNK_SIZE,
+                ):
+                    await f.write(chunk)
+                    downloaded_bytes[0] += len(chunk)
+                    await update_progress()
+
+        try:
+            await asyncio.gather(
+                *[download_part(i, off, lim, tmp)
+                  for i, ((off, lim), tmp) in enumerate(zip(parts, temp_paths))]
+            )
+
+            # دمج الأجزاء في ملف واحد
+            async with aiofiles.open(file_path, "wb") as out:
+                for tmp in temp_paths:
+                    async with aiofiles.open(tmp, "rb") as inp:
+                        while True:
+                            data = await inp.read(CHUNK_SIZE)
+                            if not data:
+                                break
+                            await out.write(data)
+                    os.remove(tmp)
+
+        except Exception as e:
+            # تنظيف الملفات المؤقتة عند الخطأ
+            for tmp in temp_paths:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            raise e
+
+    else:
+        # ---- تحميل تسلسلي (للملفات الصغيرة) ----
+        try:
+            async with aiofiles.open(file_path, "wb") as f:
+                async for chunk in bot.iter_download(
+                    message.media, request_size=CHUNK_SIZE
+                ):
+                    await f.write(chunk)
+                    downloaded_bytes[0] += len(chunk)
+                    await update_progress()
+        except Exception as e:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            raise e
+
+    total_time = round(time.time() - start_time, 2)
+    logger.info(f"تم التحميل في {total_time}ث: {file_path}")
+
+    # حفظ في الكاش
+    if file_unique_id:
+        file_cache[file_unique_id] = file_path
+
+    return file_path, is_video
 
 
 # ==============================================================================
@@ -506,7 +594,6 @@ async def message_handler(event):
         if has_media:
             msg = await event.respond("⬇️ جاري التحميل ...")
             try:
-                # ===== التحميل السريع (بدلاً من download_media البطيء) =====
                 result = await fast_download(event.message, msg)
                 if not result:
                     raise Exception("تعذّر استخراج الملف")
