@@ -157,12 +157,14 @@ async def fast_download(message, status_msg) -> tuple[str, bool] | None:
             last_update[0] = now
 
         elapsed = (time.time() - start_time) or 1e-6
-        dl = downloaded_bytes[0]
+        # تقييد العداد بحجم الملف الفعلي لمنع تجاوز 100%
+        dl = min(downloaded_bytes[0], file_size) if file_size > 0 else downloaded_bytes[0]
         speed = dl / elapsed
 
         if file_size > 0:
-            percent = dl * 100 / file_size
-            eta = format_eta(int((file_size - dl) / (speed or 1)))
+            percent = min(dl * 100 / file_size, 100.0)
+            remaining = max(file_size - dl, 0)
+            eta = format_eta(int(remaining / (speed or 1)))
             text = (
                 f"⬇️ جاري التحميل ...\n"
                 f"{format_size(dl)} / {format_size(file_size)} ({percent:.1f}%)\n"
@@ -204,6 +206,7 @@ async def fast_download(message, status_msg) -> tuple[str, bool] | None:
         temp_paths = [f"{file_path}.part{i}" for i in range(len(parts))]
 
         async def download_part(idx: int, offset: int, limit: int, tmp: str):
+            written = 0
             async with aiofiles.open(tmp, "wb") as f:
                 async for chunk in bot.iter_download(
                     message.media,
@@ -211,8 +214,14 @@ async def fast_download(message, status_msg) -> tuple[str, bool] | None:
                     limit=limit,
                     request_size=CHUNK_SIZE,
                 ):
-                    await f.write(chunk)
-                    downloaded_bytes[0] += len(chunk)
+                    # تقييد الكتابة بالحجم المحدد للجزء فقط — منع التجاوز
+                    remaining = limit - written
+                    if remaining <= 0:
+                        break
+                    data = chunk[:remaining]
+                    await f.write(data)
+                    written += len(data)
+                    downloaded_bytes[0] += len(data)
                     await update_progress()
 
         try:
